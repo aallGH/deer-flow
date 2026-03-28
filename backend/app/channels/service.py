@@ -16,6 +16,7 @@ _CHANNEL_REGISTRY: dict[str, str] = {
     "feishu": "app.channels.feishu:FeishuChannel",
     "slack": "app.channels.slack:SlackChannel",
     "telegram": "app.channels.telegram:TelegramChannel",
+    "wecom": "app.channels.wecom:WeComChannel",
 }
 
 
