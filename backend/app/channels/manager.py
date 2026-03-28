@@ -5,16 +5,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
+import posixpath
 import time
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Mapping, Callable, Awaitable
+from dataclasses import dataclass, replace as _dc_replace
+from typing import Any, TypeVar, ParamSpec
 
 import httpx
 
+from deerflow.config.paths import get_paths
 from app.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
 from app.channels.store import ChannelStore
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+P = ParamSpec("P")
 
 DEFAULT_LANGGRAPH_URL = "http://localhost:2024"
 DEFAULT_GATEWAY_URL = "http://localhost:8001"
@@ -27,12 +33,73 @@ DEFAULT_RUN_CONTEXT: dict[str, Any] = {
     "subagent_enabled": False,
 }
 STREAM_UPDATE_MIN_INTERVAL_SECONDS = 0.35
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_BASE_DELAY = 2
 
 CHANNEL_CAPABILITIES = {
     "feishu": {"supports_streaming": True},
+    "wecom": {"supports_streaming": True},
     "slack": {"supports_streaming": False},
     "telegram": {"supports_streaming": False},
 }
+
+
+@dataclass
+class RetryConfig:
+    """Configuration for retry behavior."""
+
+    max_retries: int = DEFAULT_MAX_RETRIES
+    base_delay: float = DEFAULT_RETRY_BASE_DELAY
+    retryable_exceptions: tuple[type[BaseException], ...] = (
+        httpx.TransportError,
+        httpx.TimeoutException,
+        httpx.HTTPStatusError,
+    )
+
+
+def is_retryable_exception(exc: BaseException) -> bool:
+    """Check if an exception should trigger a retry."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        # Retry on 404 (thread not found), 429 (rate limit), 5xx (server errors)
+        status_code = exc.response.status_code
+        return status_code in (404, 429) or status_code >= 500
+    return isinstance(exc, (httpx.TransportError, httpx.TimeoutException))
+
+
+async def retry_async(
+    func: Callable[P, Awaitable[T]],
+    config: RetryConfig | None = None,
+    on_retry: Callable[[int, BaseException, float], Awaitable[None]] | None = None,
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> T:
+    """Async retry decorator with exponential backoff."""
+    config = config or RetryConfig()
+    last_exception: BaseException | None = None
+
+    for attempt in range(config.max_retries + 1):
+        try:
+            return await func(*args, **kwargs)
+        except BaseException as exc:
+            last_exception = exc
+            if not is_retryable_exception(exc) or attempt >= config.max_retries:
+                raise
+
+            wait_time = config.base_delay ** (attempt + 1)
+            logger.warning(
+                "[Manager] Operation failed (attempt %d/%d), retrying in %.1fs: %s",
+                attempt + 1,
+                config.max_retries + 1,
+                wait_time,
+                str(exc),
+            )
+
+            if on_retry:
+                await on_retry(attempt, exc, wait_time)
+
+            await asyncio.sleep(wait_time)
+
+    raise last_exception or RuntimeError("Retry loop completed unexpectedly")
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -229,8 +296,6 @@ def _extract_artifacts(result: dict | list) -> list[str]:
 
 def _format_artifact_text(artifacts: list[str]) -> str:
     """Format artifact paths into a human-readable text block listing filenames."""
-    import posixpath
-
     filenames = [posixpath.basename(p) for p in artifacts]
     if len(filenames) == 1:
         return f"Created File: 📎 {filenames[0]}"
@@ -250,8 +315,6 @@ def _resolve_attachments(thread_id: str, artifacts: list[str]) -> list[ResolvedA
     Skips artifacts that cannot be resolved (missing files, invalid paths)
     and logs warnings for them.
     """
-    from deerflow.config.paths import get_paths
-
     attachments: list[ResolvedAttachment] = []
     paths = get_paths()
     outputs_dir = paths.sandbox_outputs_dir(thread_id).resolve()
@@ -464,34 +527,24 @@ class ChannelManager:
 
     # -- chat handling -----------------------------------------------------
 
-    async def _create_thread(self, client, msg: InboundMessage, max_retries: int = 3) -> str:
+    async def _create_thread(self, client, msg: InboundMessage, max_retries: int = DEFAULT_MAX_RETRIES) -> str:
         """Create a new thread on the LangGraph Server and store the mapping with retries on failure."""
-        retry_count = 0
 
-        while retry_count <= max_retries:
-            try:
-                thread = await client.threads.create()
-                thread_id = thread["thread_id"]
-                self.store.set_thread_id(
-                    msg.channel_name,
-                    msg.chat_id,
-                    thread_id,
-                    topic_id=msg.topic_id,
-                    user_id=msg.user_id,
-                )
-                logger.info("[Manager] new thread created on LangGraph Server: thread_id=%s for chat_id=%s topic_id=%s", thread_id, msg.chat_id, msg.topic_id)
-                return thread_id
-            except (httpx.TransportError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
-                retry_count += 1
-                if retry_count <= max_retries:
-                    wait_time = 2**retry_count
-                    logger.warning("[Manager] Failed to create thread (attempt %d/%d), retrying in %ds: %s", retry_count, max_retries + 1, wait_time, str(e))
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error("[Manager] Max retries exceeded while creating thread")
-                    raise
+        async def _create() -> str:
+            thread = await client.threads.create()
+            thread_id = thread["thread_id"]
+            self.store.set_thread_id(
+                msg.channel_name,
+                msg.chat_id,
+                thread_id,
+                topic_id=msg.topic_id,
+                user_id=msg.user_id,
+            )
+            logger.info("[Manager] new thread created on LangGraph Server: thread_id=%s for chat_id=%s topic_id=%s", thread_id, msg.chat_id, msg.topic_id)
+            return thread_id
 
-        raise RuntimeError("Unexpected error: _create_thread loop completed without returning or raising")
+        config = RetryConfig(max_retries=max_retries) if max_retries != DEFAULT_MAX_RETRIES else None
+        return await retry_async(_create, config=config)
 
     async def _handle_chat(self, msg: InboundMessage, extra_context: dict[str, Any] | None = None) -> None:
         client = self._get_client()
@@ -718,8 +771,6 @@ class ChannelManager:
         command = parts[0].lower().lstrip("/")
 
         if command == "bootstrap":
-            from dataclasses import replace as _dc_replace
-
             chat_text = parts[1] if len(parts) > 1 else "Initialize workspace"
             chat_msg = _dc_replace(msg, text=chat_text, msg_type=InboundMessageType.CHAT)
             await self._handle_chat(chat_msg, extra_context={"is_bootstrap": True})
@@ -769,8 +820,6 @@ class ChannelManager:
 
     async def _fetch_gateway(self, path: str, kind: str) -> str:
         """Fetch data from the Gateway API for command responses."""
-        import httpx
-
         try:
             async with httpx.AsyncClient() as http:
                 resp = await http.get(f"{self._gateway_url}{path}", timeout=10)
