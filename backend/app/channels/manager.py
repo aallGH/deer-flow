@@ -7,15 +7,16 @@ import logging
 import mimetypes
 import posixpath
 import time
-from collections.abc import Mapping, Callable, Awaitable
-from dataclasses import dataclass, replace as _dc_replace
-from typing import Any, TypeVar, ParamSpec
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from dataclasses import replace as _dc_replace
+from typing import Any, ParamSpec, TypeVar
 
 import httpx
 
-from deerflow.config.paths import get_paths
 from app.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
 from app.channels.store import ChannelStore
+from deerflow.config.paths import get_paths
 
 logger = logging.getLogger(__name__)
 
@@ -75,13 +76,11 @@ async def retry_async(
 ) -> T:
     """Async retry decorator with exponential backoff."""
     config = config or RetryConfig()
-    last_exception: BaseException | None = None
 
     for attempt in range(config.max_retries + 1):
         try:
             return await func(*args, **kwargs)
         except BaseException as exc:
-            last_exception = exc
             if not is_retryable_exception(exc) or attempt >= config.max_retries:
                 raise
 
@@ -99,7 +98,9 @@ async def retry_async(
 
             await asyncio.sleep(wait_time)
 
-    raise last_exception or RuntimeError("Retry loop completed unexpectedly")
+    # The loop should always return or raise, so this line is unreachable
+    # Kept for type safety
+    raise RuntimeError("Retry loop completed unexpectedly")
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -511,19 +512,25 @@ class ChannelManager:
             logger.error("[Manager] unhandled error in message task: %s", exc, exc_info=exc)
 
     async def _handle_message(self, msg: InboundMessage) -> None:
-        async with self._semaphore:
-            try:
-                if msg.msg_type == InboundMessageType.COMMAND:
-                    await self._handle_command(msg)
-                else:
-                    await self._handle_chat(msg)
-            except Exception:
-                logger.exception(
-                    "Error handling message from %s (chat=%s)",
-                    msg.channel_name,
-                    msg.chat_id,
-                )
-                await self._send_error(msg, "An internal error occurred. Please try again.")
+        if self._semaphore:
+            async with self._semaphore:
+                await self._process_message(msg)
+        else:
+            await self._process_message(msg)
+
+    async def _process_message(self, msg: InboundMessage) -> None:
+        try:
+            if msg.msg_type == InboundMessageType.COMMAND:
+                await self._handle_command(msg)
+            else:
+                await self._handle_chat(msg)
+        except Exception:
+            logger.exception(
+                "Error handling message from %s (chat=%s)",
+                msg.channel_name,
+                msg.chat_id,
+            )
+            await self._send_error(msg, "An internal error occurred. Please try again.")
 
     # -- chat handling -----------------------------------------------------
 
@@ -575,43 +582,29 @@ class ChannelManager:
             return
 
         logger.info("[Manager] invoking runs.wait(thread_id=%s, text=%r)", thread_id, msg.text[:100])
-        max_retries = 3
-        retry_count = 0
-        last_error = None
-
-        while retry_count <= max_retries:
+        
+        current_thread_id = thread_id
+        
+        async def _run_with_thread_recreation() -> Any:
+            nonlocal current_thread_id
             try:
-                result = await client.runs.wait(
-                    thread_id,
+                return await client.runs.wait(
+                    current_thread_id,
                     assistant_id,
                     input={"messages": [{"role": "human", "content": msg.text}]},
                     config=run_config,
                     context=run_context,
                 )
-                break
             except httpx.HTTPStatusError as e:
-                last_error = e
                 if e.response.status_code == 404 and "Thread or assistant not found" in str(e.response.content):
-                    logger.warning("[Manager] Thread %s not found on server (attempt %d/%d), recreating thread", thread_id, retry_count + 1, max_retries + 1)
+                    logger.warning("[Manager] Thread %s not found on server, recreating thread", current_thread_id)
                     self.store.remove(msg.channel_name, msg.chat_id, topic_id=msg.topic_id)
-                    thread_id = await self._create_thread(client, msg)
-                    logger.info("[Manager] Retrying request with new thread %s", thread_id)
-                    retry_count += 1
-                else:
-                    raise
-            except (httpx.TransportError, httpx.TimeoutException) as e:
-                last_error = e
-                retry_count += 1
-                if retry_count <= max_retries:
-                    wait_time = 2**retry_count
-                    logger.warning("[Manager] Network error (attempt %d/%d), retrying in %ds: %s", retry_count, max_retries + 1, wait_time, str(e))
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error("[Manager] Max retries exceeded after network failures")
-                    raise
-        else:
-            if last_error:
-                raise last_error
+                    current_thread_id = await self._create_thread(client, msg)
+                    logger.info("[Manager] Retrying request with new thread %s", current_thread_id)
+                raise
+        
+        result = await retry_async(_run_with_thread_recreation)
+        thread_id = current_thread_id
 
         response_text = _extract_response_text(result)
         artifacts = _extract_artifacts(result)
@@ -653,23 +646,23 @@ class ChannelManager:
         run_context: dict[str, Any],
     ) -> None:
         logger.info("[Manager] invoking runs.stream(thread_id=%s, text=%r)", thread_id, msg.text[:100])
-
-        max_retries = 3
-        retry_count = 0
-        last_error = None
-
-        while retry_count <= max_retries:
-            last_values: dict[str, Any] | list | None = None
+        
+        current_thread_id = thread_id
+        last_values: dict[str, Any] | list | None = None
+        latest_text = ""
+        
+        async def _stream_with_thread_recreation() -> tuple[dict[str, Any] | list | None, str]:
+            nonlocal current_thread_id, last_values, latest_text
+            last_values = None
+            latest_text = ""
             streamed_buffers: dict[str, str] = {}
             current_message_id: str | None = None
-            latest_text = ""
             last_published_text = ""
             last_publish_at = 0.0
-            stream_error: BaseException | None = None
-
+            
             try:
                 async for chunk in client.runs.stream(
-                    thread_id,
+                    current_thread_id,
                     assistant_id,
                     input={"messages": [{"role": "human", "content": msg.text}]},
                     config=run_config,
@@ -700,7 +693,7 @@ class ChannelManager:
                         OutboundMessage(
                             channel_name=msg.channel_name,
                             chat_id=msg.chat_id,
-                            thread_id=thread_id,
+                            thread_id=current_thread_id,
                             text=latest_text,
                             is_final=False,
                             thread_ts=msg.thread_ts,
@@ -708,30 +701,17 @@ class ChannelManager:
                     )
                     last_published_text = latest_text
                     last_publish_at = now
-                break
+                return last_values, latest_text
             except httpx.HTTPStatusError as e:
-                last_error = e
                 if e.response.status_code == 404 and "Thread or assistant not found" in str(e.response.content):
-                    logger.warning("[Manager] Thread %s not found on server (attempt %d/%d), recreating thread", thread_id, retry_count + 1, max_retries + 1)
+                    logger.warning("[Manager] Thread %s not found on server, recreating thread", current_thread_id)
                     self.store.remove(msg.channel_name, msg.chat_id, topic_id=msg.topic_id)
-                    thread_id = await self._create_thread(client, msg)
-                    logger.info("[Manager] Retrying streaming with new thread %s", thread_id)
-                    retry_count += 1
-                else:
-                    raise
-            except (httpx.TransportError, httpx.TimeoutException) as e:
-                last_error = e
-                retry_count += 1
-                if retry_count <= max_retries:
-                    wait_time = 2**retry_count
-                    logger.warning("[Manager] Network error (attempt %d/%d), retrying streaming in %ds: %s", retry_count, max_retries + 1, wait_time, str(e))
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error("[Manager] Max retries exceeded after network failures in streaming")
-                    raise
-        else:
-            if last_error:
-                raise last_error
+                    current_thread_id = await self._create_thread(client, msg)
+                    logger.info("[Manager] Retrying streaming with new thread %s", current_thread_id)
+                raise
+        
+        last_values, latest_text = await retry_async(_stream_with_thread_recreation)
+        thread_id = current_thread_id
 
         result = last_values if last_values is not None else {"messages": [{"type": "ai", "content": latest_text}]}
         response_text = _extract_response_text(result)

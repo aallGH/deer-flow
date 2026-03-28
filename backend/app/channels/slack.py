@@ -34,7 +34,10 @@ class SlackChannel(Channel):
 
     async def start(self) -> None:
         if self._running:
+            logger.warning("Slack channel already running, skipping start()")
             return
+
+        self._running = True  # Set early to prevent race conditions
 
         try:
             from slack_sdk import WebClient
@@ -42,6 +45,7 @@ class SlackChannel(Channel):
             from slack_sdk.socket_mode.response import SocketModeResponse
         except ImportError:
             logger.error("slack-sdk is not installed. Install it with: uv add slack-sdk")
+            self._running = False
             return
 
         self._SocketModeResponse = SocketModeResponse
@@ -51,6 +55,7 @@ class SlackChannel(Channel):
 
         if not bot_token or not app_token:
             logger.error("Slack channel requires bot_token and app_token")
+            self._running = False
             return
 
         self._web_client = WebClient(token=bot_token)
@@ -62,8 +67,8 @@ class SlackChannel(Channel):
 
         self._socket_client.socket_mode_request_listeners.append(self._on_socket_event)
 
-        self._running = True
         self.bus.subscribe_outbound(self._on_outbound)
+        logger.info("Slack channel subscribed to message bus")
 
         # Start socket mode in background thread
         asyncio.get_event_loop().run_in_executor(None, self._socket_client.connect)

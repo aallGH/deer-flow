@@ -151,7 +151,8 @@ class MessageBus:
 
     def subscribe_outbound(self, callback: OutboundCallback) -> None:
         """Register an async callback for outbound messages."""
-        self._outbound_listeners.append(callback)
+        if callback not in self._outbound_listeners:
+            self._outbound_listeners.append(callback)
 
     def unsubscribe_outbound(self, callback: OutboundCallback) -> None:
         """Remove a previously registered outbound callback."""

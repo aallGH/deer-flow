@@ -52,7 +52,10 @@ class FeishuChannel(Channel):
 
     async def start(self) -> None:
         if self._running:
+            logger.warning("Feishu channel already running, skipping start()")
             return
+
+        self._running = True  # Set early to prevent race conditions
 
         try:
             import lark_oapi as lark
@@ -73,6 +76,7 @@ class FeishuChannel(Channel):
             )
         except ImportError:
             logger.error("lark-oapi is not installed. Install it with: uv add lark-oapi")
+            self._running = False
             return
 
         self._lark = lark
@@ -95,13 +99,14 @@ class FeishuChannel(Channel):
 
         if not app_id or not app_secret:
             logger.error("Feishu channel requires app_id and app_secret")
+            self._running = False
             return
 
         self._api_client = lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
         self._main_loop = asyncio.get_event_loop()
 
-        self._running = True
         self.bus.subscribe_outbound(self._on_outbound)
+        logger.info("Feishu channel subscribed to message bus")
 
         # Both ws.Client construction and start() must happen in a dedicated
         # thread with its own event loop.  lark-oapi caches the running loop
