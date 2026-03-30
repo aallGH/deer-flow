@@ -14,6 +14,8 @@ from typing import Any, ParamSpec, TypeVar
 
 import httpx
 
+from langgraph_sdk.errors import ConflictError
+
 from app.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
 from app.channels.store import ChannelStore
 from deerflow.config.paths import get_paths
@@ -35,8 +37,7 @@ DEFAULT_RUN_CONTEXT: dict[str, Any] = {
     "subagent_enabled": False,
 }
 STREAM_UPDATE_MIN_INTERVAL_SECONDS = 0.35
-DEFAULT_MAX_RETRIES = 3
-DEFAULT_RETRY_BASE_DELAY = 2
+THREAD_BUSY_MESSAGE = "This conversation is already processing another request. Please wait for it to finish and try again."
 
 CHANNEL_CAPABILITIES = {
     "feishu": {"supports_streaming": True},
@@ -104,6 +105,14 @@ async def retry_async(
     raise RuntimeError("Retry loop completed unexpectedly")
 
 
+def _is_thread_busy_error(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    if isinstance(exc, ConflictError):
+        return True
+    return "already running a task" in str(exc)
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
@@ -120,14 +129,9 @@ def _normalize_custom_agent_name(raw_value: str) -> str:
     """Normalize legacy channel assistant IDs into valid custom agent names."""
     normalized = raw_value.strip().lower().replace("_", "-")
     if not normalized:
-        raise InvalidChannelSessionConfigError(
-            "Channel session assistant_id is empty. Use 'lead_agent' or a valid custom agent name."
-        )
+        raise InvalidChannelSessionConfigError("Channel session assistant_id is empty. Use 'lead_agent' or a valid custom agent name.")
     if not CUSTOM_AGENT_NAME_PATTERN.fullmatch(normalized):
-        raise InvalidChannelSessionConfigError(
-            f"Invalid channel session assistant_id {raw_value!r}. "
-            "Use 'lead_agent' or a custom agent name containing only letters, digits, and hyphens."
-        )
+        raise InvalidChannelSessionConfigError(f"Invalid channel session assistant_id {raw_value!r}. Use 'lead_agent' or a custom agent name containing only letters, digits, and hyphens.")
     return normalized
 
 
