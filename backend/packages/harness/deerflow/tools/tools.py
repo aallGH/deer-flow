@@ -10,7 +10,9 @@ from deerflow.tools.builtins.tool_search import reset_deferred_registry
 logger = logging.getLogger(__name__)
 
 BUILTIN_TOOLS = [
+    ask_clarification_tool,
     present_file_tool,
+    view_image_tool,
     *DUCKDUCKGO_TOOLS,
 ]
 

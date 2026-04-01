@@ -5,7 +5,7 @@ DuckDuckGo搜索工具 - DeerFlow内置工具
 import logging
 from typing import Optional
 
-from langchain_community.tools import DuckDuckGoSearchRun, DuckDuckGoSearchResults
+from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from langchain_core.tools import BaseTool
 
