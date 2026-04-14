@@ -19,8 +19,7 @@ pip install -r requirements.txt
 ### 步骤 3: 完成认证 (1 分钟)
 
 ```bash
-cd scripts
-python auth_setup.py
+python scripts/auth_setup.py
 ```
 
 浏览器会自动打开，完成授权即可。
