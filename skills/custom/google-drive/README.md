@@ -123,9 +123,16 @@ python search_files.py --type doc --modified-after "2024-01-01T00:00:00"
 ### LangGraph 节点示例
 
 ```python
-from langgraph.graph import StateGraph
-from scripts.utils import get_credentials, build_drive_service
+import sys
+from pathlib import Path
 
+from langgraph.graph import StateGraph
+
+SCRIPTS_DIR = Path.cwd() / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from utils import get_credentials, build_drive_service
 def google_drive_node(state):
     """Google Drive 集成节点"""
     creds = get_credentials()
