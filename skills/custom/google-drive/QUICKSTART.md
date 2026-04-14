@@ -5,7 +5,7 @@
 ### 步骤 1: 安装依赖 (1 分钟)
 
 ```bash
-cd google-drive-integration
+cd skills/custom/google-drive
 pip install -r requirements.txt
 ```
 
