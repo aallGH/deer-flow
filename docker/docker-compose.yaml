@@ -34,7 +34,7 @@ services:
       - LANGGRAPH_UPSTREAM=${LANGGRAPH_UPSTREAM:-langgraph:2024}
       - LANGGRAPH_REWRITE=${LANGGRAPH_REWRITE:-/}
     command: >
-      sh -c "envsubst '$LANGGRAPH_UPSTREAM $LANGGRAPH_REWRITE'
+      sh -c "envsubst '$$LANGGRAPH_UPSTREAM $$LANGGRAPH_REWRITE'
       < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
       && nginx -g 'daemon off;'"
     depends_on:
