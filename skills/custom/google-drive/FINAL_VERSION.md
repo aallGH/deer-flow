@@ -80,7 +80,7 @@ python scripts/create_file.py upload test_document.txt --name "DeerFlow_Test.txt
 | 功能 | 命令 |
 |------|------|
 | **列出文件** | `python scripts/list_files.py` |
-| **读取文件** | `python scripts/read_file.py <file-id>` |
+| **读取文件** | `python scripts/read_file.py --file-id <file-id>` |
 | **上传文件** | `python scripts/create_file.py upload <local-file>` |
 | **创建文件夹** | `python scripts/create_file.py folder <name>` |
 | **搜索文件** | `python scripts/search_files.py <query>` |
