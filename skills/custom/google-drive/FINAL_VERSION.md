@@ -83,7 +83,7 @@ python scripts/create_file.py upload test_document.txt --name "DeerFlow_Test.txt
 | **读取文件** | `python scripts/read_file.py --file-id <file-id>` |
 | **上传文件** | `python scripts/create_file.py upload <local-file>` |
 | **创建文件夹** | `python scripts/create_file.py folder <name>` |
-| **搜索文件** | `python scripts/search_files.py <query>` |
+| **搜索文件** | `python scripts/search_files.py --query "<query>"` |
 
 ### 🔐 认证流程
 
