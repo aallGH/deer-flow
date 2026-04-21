@@ -51,7 +51,44 @@ class ChannelService:
         langgraph_url = _resolve_service_url(config, "langgraph_url", _CHANNELS_LANGGRAPH_URL_ENV, DEFAULT_LANGGRAPH_URL)
         gateway_url = _resolve_service_url(config, "gateway_url", _CHANNELS_GATEWAY_URL_ENV, DEFAULT_GATEWAY_URL)
         default_session = config.pop("session", None)
-        channel_sessions = {name: channel_config.get("session") for name, channel_config in config.items() if isinstance(channel_config, dict)}
+
+        # Process channel configs: expand lists to multiple instances
+        processed_config: dict[str, dict[str, Any]] = {}
+        channel_sessions: dict[str, dict[str, Any] | None] = {}
+        used_names: set[str] = set()
+
+        for name, channel_config in config.items():
+            if isinstance(channel_config, list):
+                # Multiple instances of the same channel type
+                for idx, instance_config in enumerate(channel_config):
+                    if not isinstance(instance_config, dict):
+                        continue
+
+                    # Require explicit name for list-format channels (no fragile sequential IDs)
+                    custom_name = instance_config.get("name")  # type: ignore[arg-type]
+                    if not isinstance(custom_name, str) or not custom_name.strip():
+                        raise ValueError(f"Channel {name}[{idx}] must have a unique 'name' field when using list format. Example: {{'name': 'my_bot', 'enabled': true, ...}}")
+
+                    instance_name = custom_name.strip()
+
+                    # Ensure name uniqueness
+                    if instance_name in used_names:
+                        raise ValueError(f"Duplicate channel name '{instance_name}' for {name}[{idx}]. Each channel instance must have a unique name.")
+
+                    used_names.add(instance_name)
+                    # Store base type in a copy (do NOT modify original config, which breaks channel parsing)
+                    processed_instance_config = dict(instance_config)
+                    processed_instance_config["_base_type"] = name
+                    processed_config[instance_name] = processed_instance_config
+                    channel_sessions[instance_name] = instance_config.get("session")  # type: ignore[arg-type]
+            elif isinstance(channel_config, dict):
+                # Single instance (copy config, do NOT modify original which breaks channel parsing)
+                processed_single_config = dict(channel_config)
+                processed_single_config["_base_type"] = name
+                processed_config[name] = processed_single_config
+                channel_sessions[name] = channel_config.get("session")
+                used_names.add(name)
+
         self.manager = ChannelManager(
             bus=self.bus,
             store=self.store,
@@ -61,7 +98,7 @@ class ChannelService:
             channel_sessions=channel_sessions,
         )
         self._channels: dict[str, Any] = {}  # name -> Channel instance
-        self._config = config
+        self._config = processed_config
         self._running = False
 
     @classmethod
@@ -128,9 +165,11 @@ class ChannelService:
 
     async def _start_channel(self, name: str, config: dict[str, Any]) -> bool:
         """Instantiate and start a single channel."""
-        import_path = _CHANNEL_REGISTRY.get(name)
+        # Get base type from config (set during processing) or extract from name
+        base_type = config.get("_base_type") or (name.split("_")[0] if "_" in name else name)
+        import_path = _CHANNEL_REGISTRY.get(base_type)
         if not import_path:
-            logger.warning("Unknown channel type: %s", name)
+            logger.warning("Unknown channel type: %s (base type: %s)", name, base_type)
             return False
 
         try:
@@ -138,11 +177,14 @@ class ChannelService:
 
             channel_cls = resolve_class(import_path, base_class=None)
         except Exception:
-            logger.exception("Failed to import channel class for %s", name)
+            logger.exception("Failed to import channel class for %s (base type: %s)", name, base_type)
             return False
 
         try:
             channel = channel_cls(bus=self.bus, config=config)
+            # Set the correct name attribute on the channel
+            if hasattr(channel, "name"):
+                channel.name = name
             await channel.start()
             self._channels[name] = channel
             logger.info("Channel %s started", name)
@@ -154,6 +196,8 @@ class ChannelService:
     def get_status(self) -> dict[str, Any]:
         """Return status information for all channels."""
         channels_status = {}
+
+        # First pass: legacy format (backward compatibility)
         for name in _CHANNEL_REGISTRY:
             config = self._config.get(name, {})
             enabled = isinstance(config, dict) and config.get("enabled", False)
@@ -162,6 +206,32 @@ class ChannelService:
                 "enabled": enabled,
                 "running": running,
             }
+
+        # Second pass: add multi-instance information
+        for base_type in _CHANNEL_REGISTRY:
+            # Check for instances of this type (feishu, feishu_0, feishu_1, etc.)
+            instances = []
+            for full_name in self._config:
+                if full_name == base_type or full_name.startswith(f"{base_type}_"):
+                    config = self._config[full_name]
+                    enabled = isinstance(config, dict) and config.get("enabled", False)
+                    running = full_name in self._channels and self._channels[full_name].is_running
+                    instances.append(
+                        {
+                            "name": full_name,
+                            "enabled": enabled,
+                            "running": running,
+                        }
+                    )
+            if instances:
+                channels_status[base_type].update(
+                    {
+                        "instances": instances,
+                        "total_enabled": sum(1 for inst in instances if inst["enabled"]),
+                        "total_running": sum(1 for inst in instances if inst["running"]),
+                    }
+                )
+
         return {
             "service_running": self._running,
             "channels": channels_status,

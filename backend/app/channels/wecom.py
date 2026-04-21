@@ -57,7 +57,7 @@ class WeComChannel(Channel):
 
         self._bot_id = bot_id if isinstance(bot_id, str) and bot_id else None
         self._bot_secret = bot_secret if isinstance(bot_secret, str) and bot_secret else None
-        self._working_message = working_message if isinstance(working_message, str) and working_message else "Working on it..."
+        self._working_message = working_message if isinstance(working_message, str) and working_message else ""
 
         if not self._bot_id or not self._bot_secret:
             logger.error("WeCom channel requires bot_id and bot_secret")

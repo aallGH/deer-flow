@@ -59,3 +59,4 @@ config.yaml.bak
 /frontend/playwright-report/
 .gstack/
 .worktrees
+backend/app/channels/wecom.py
