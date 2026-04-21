@@ -181,10 +181,24 @@ class ChannelService:
             return False
 
         try:
-            channel = channel_cls(bus=self.bus, config=config)
-            # Set the correct name attribute on the channel
-            if hasattr(channel, "name"):
-                channel.name = name
+            # Pass name directly to constructor if supported by this channel class
+            try:
+                # Check if constructor accepts name parameter
+                import inspect
+                sig = inspect.signature(channel_cls.__init__)
+                has_name_param = "name" in sig.parameters
+                if has_name_param:
+                    channel = channel_cls(bus=self.bus, config=config, name=name)
+                else:
+                    channel = channel_cls(bus=self.bus, config=config)
+                    if hasattr(channel, "name"):
+                        channel.name = name
+            except Exception:
+                # Fall back to old method if anything goes wrong
+                channel = channel_cls(bus=self.bus, config=config)
+                if hasattr(channel, "name"):
+                    channel.name = name
+
             await channel.start()
             self._channels[name] = channel
             logger.info("Channel %s started", name)
@@ -209,12 +223,14 @@ class ChannelService:
 
         # Second pass: add multi-instance information
         for base_type in _CHANNEL_REGISTRY:
-            # Check for instances of this type (feishu, feishu_0, feishu_1, etc.)
+            # Group instances by the processed config's base type so custom instance names are included
             instances = []
-            for full_name in self._config:
-                if full_name == base_type or full_name.startswith(f"{base_type}_"):
-                    config = self._config[full_name]
-                    enabled = isinstance(config, dict) and config.get("enabled", False)
+            for full_name, config in self._config.items():
+                if not isinstance(config, dict):
+                    continue
+                config_base_type = config.get("_base_type", full_name)
+                if config_base_type == base_type:
+                    enabled = config.get("enabled", False)
                     running = full_name in self._channels and self._channels[full_name].is_running
                     instances.append(
                         {

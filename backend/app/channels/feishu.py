@@ -47,11 +47,13 @@ class FeishuChannel(Channel):
         5. Bot adds "DONE" emoji reaction to the original message
     """
 
-    def __init__(self, bus: MessageBus, config: dict[str, Any]) -> None:
-        super().__init__(name="feishu", bus=bus, config=config)
+    def __init__(self, bus: MessageBus, config: dict[str, Any], name: str = "feishu") -> None:
+        super().__init__(name=name, bus=bus, config=config)
         self._thread: threading.Thread | None = None
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._api_client = None
+        self._api_client_ready = threading.Event()
+        self._api_client_init_error: Exception | None = None
         self._CreateMessageReactionRequest = None
         self._CreateMessageReactionRequestBody = None
         self._Emoji = None
@@ -115,67 +117,76 @@ class FeishuChannel(Channel):
         """
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        self._api_client_ready.clear()
+        self._api_client_init_error = None
         try:
             # Acquire the global lock to ensure sequential initialization
             with _feishu_start_lock:
                 import sys
 
-                # Completely unload any previously cached lark_oapi modules
-                for module_name in list(sys.modules.keys()):
-                    if module_name.startswith("lark_oapi"):
-                        del sys.modules[module_name]
+                try:
+                    # Completely unload any previously cached lark_oapi modules
+                    for module_name in list(sys.modules.keys()):
+                        if module_name.startswith("lark_oapi"):
+                            del sys.modules[module_name]
 
-                # Import lark_oapi ONLY inside this thread with the fresh loop
-                import lark_oapi as lark
-                import lark_oapi.ws.client as _ws_client_mod
-                from lark_oapi.api.im.v1 import (
-                    CreateFileRequest,
-                    CreateFileRequestBody,
-                    CreateImageRequest,
-                    CreateImageRequestBody,
-                    CreateMessageReactionRequest,
-                    CreateMessageReactionRequestBody,
-                    CreateMessageRequest,
-                    CreateMessageRequestBody,
-                    Emoji,
-                    GetMessageResourceRequest,
-                    PatchMessageRequest,
-                    PatchMessageRequestBody,
-                    ReplyMessageRequest,
-                    ReplyMessageRequestBody,
-                )
+                    # Import lark_oapi ONLY inside this thread with the fresh loop
+                    import lark_oapi as lark
+                    import lark_oapi.ws.client as _ws_client_mod
+                    from lark_oapi.api.im.v1 import (
+                        CreateFileRequest,
+                        CreateFileRequestBody,
+                        CreateImageRequest,
+                        CreateImageRequestBody,
+                        CreateMessageReactionRequest,
+                        CreateMessageReactionRequestBody,
+                        CreateMessageRequest,
+                        CreateMessageRequestBody,
+                        Emoji,
+                        GetMessageResourceRequest,
+                        PatchMessageRequest,
+                        PatchMessageRequestBody,
+                        ReplyMessageRequest,
+                        ReplyMessageRequestBody,
+                    )
 
-                # Store all the API components on self for use in other methods
-                self._lark = lark
-                self._CreateMessageRequest = CreateMessageRequest
-                self._CreateMessageRequestBody = CreateMessageRequestBody
-                self._ReplyMessageRequest = ReplyMessageRequest
-                self._ReplyMessageRequestBody = ReplyMessageRequestBody
-                self._CreateMessageReactionRequest = CreateMessageReactionRequest
-                self._CreateMessageReactionRequestBody = CreateMessageReactionRequestBody
-                self._Emoji = Emoji
-                self._PatchMessageRequest = PatchMessageRequest
-                self._PatchMessageRequestBody = PatchMessageRequestBody
-                self._CreateFileRequest = CreateFileRequest
-                self._CreateFileRequestBody = CreateFileRequestBody
-                self._CreateImageRequest = CreateImageRequest
-                self._CreateImageRequestBody = CreateImageRequestBody
-                self._GetMessageResourceRequest = GetMessageResourceRequest
+                    # Store all the API components on self for use in other methods
+                    self._lark = lark
+                    self._CreateMessageRequest = CreateMessageRequest
+                    self._CreateMessageRequestBody = CreateMessageRequestBody
+                    self._ReplyMessageRequest = ReplyMessageRequest
+                    self._ReplyMessageRequestBody = ReplyMessageRequestBody
+                    self._CreateMessageReactionRequest = CreateMessageReactionRequest
+                    self._CreateMessageReactionRequestBody = CreateMessageReactionRequestBody
+                    self._Emoji = Emoji
+                    self._PatchMessageRequest = PatchMessageRequest
+                    self._PatchMessageRequestBody = PatchMessageRequestBody
+                    self._CreateFileRequest = CreateFileRequest
+                    self._CreateFileRequestBody = CreateFileRequestBody
+                    self._CreateImageRequest = CreateImageRequest
+                    self._CreateImageRequestBody = CreateImageRequestBody
+                    self._GetMessageResourceRequest = GetMessageResourceRequest
 
-                # Create the API client
-                self._api_client = lark.Client.builder().app_id(app_id).app_secret(app_secret).domain(domain).build()
+                    # Create the API client and mark it ready for outbound sends
+                    self._api_client = lark.Client.builder().app_id(app_id).app_secret(app_secret).domain(domain).build()
+                    self._api_client_ready.set()
 
-                # Replace the SDK's module-level loop just to be safe
-                _ws_client_mod.loop = loop
+                    # Replace the SDK's module-level loop just to be safe
+                    _ws_client_mod.loop = loop
 
-                event_handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(self._on_message).build()
-                ws_client = lark.ws.Client(
-                    app_id=app_id,
-                    app_secret=app_secret,
-                    event_handler=event_handler,
-                    log_level=lark.LogLevel.INFO,
-                    domain=domain,
-                )
+                    event_handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(self._on_message).build()
+                    ws_client = lark.ws.Client(
+                        app_id=app_id,
+                        app_secret=app_secret,
+                        event_handler=event_handler,
+                        log_level=lark.LogLevel.INFO,
+                        domain=domain,
+                    )
+                except Exception as exc:
+                    self._api_client = None
+                    self._api_client_init_error = exc
+                    self._api_client_ready.set()
+                    raise
             # Release the lock before starting the client, so other channels
             # can initialize while this one runs
             ws_client.start()
