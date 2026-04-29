@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.channels.base import Channel
 from app.channels.manager import DEFAULT_GATEWAY_URL, DEFAULT_LANGGRAPH_URL, ChannelManager
@@ -12,6 +12,9 @@ from app.channels.message_bus import MessageBus
 from app.channels.store import ChannelStore
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from deerflow.config.app_config import AppConfig
 
 # Channel name → import path for lazy loading
 _CHANNEL_REGISTRY: dict[str, str] = {
@@ -21,6 +24,16 @@ _CHANNEL_REGISTRY: dict[str, str] = {
     "telegram": "app.channels.telegram:TelegramChannel",
     "wechat": "app.channels.wechat:WechatChannel",
     "wecom": "app.channels.wecom:WeComChannel",
+}
+
+# Keys that indicate a user has configured credentials for a channel.
+_CHANNEL_CREDENTIAL_KEYS: dict[str, list[str]] = {
+    "discord": ["bot_token"],
+    "feishu": ["app_id", "app_secret"],
+    "slack": ["bot_token", "app_token"],
+    "telegram": ["bot_token"],
+    "wecom": ["bot_id", "bot_secret"],
+    "wechat": ["bot_token"],
 }
 
 _CHANNELS_LANGGRAPH_URL_ENV = "DEER_FLOW_CHANNELS_LANGGRAPH_URL"
@@ -102,14 +115,15 @@ class ChannelService:
         self._running = False
 
     @classmethod
-    def from_app_config(cls) -> ChannelService:
+    def from_app_config(cls, app_config: AppConfig | None = None) -> ChannelService:
         """Create a ChannelService from the application config."""
-        from deerflow.config.app_config import get_app_config
+        if app_config is None:
+            from deerflow.config.app_config import get_app_config
 
-        config = get_app_config()
+            app_config = get_app_config()
         channels_config = {}
         # extra fields are allowed by AppConfig (extra="allow")
-        extra = config.model_extra or {}
+        extra = app_config.model_extra or {}
         if "channels" in extra:
             channels_config = extra["channels"]
         return cls(channels_config=channels_config)
@@ -125,7 +139,16 @@ class ChannelService:
             if not isinstance(channel_config, dict):
                 continue
             if not channel_config.get("enabled", False):
-                logger.info("Channel %s is disabled, skipping", name)
+                cred_keys = _CHANNEL_CREDENTIAL_KEYS.get(name, [])
+                has_creds = any(not isinstance(channel_config.get(k), bool) and channel_config.get(k) is not None and str(channel_config[k]).strip() for k in cred_keys)
+                if has_creds:
+                    logger.warning(
+                        "Channel '%s' has credentials configured but is disabled. Set enabled: true under channels.%s in config.yaml to activate it.",
+                        name,
+                        name,
+                    )
+                else:
+                    logger.info("Channel %s is disabled, skipping", name)
                 continue
 
             await self._start_channel(name, channel_config)
@@ -268,12 +291,12 @@ def get_channel_service() -> ChannelService | None:
     return _channel_service
 
 
-async def start_channel_service() -> ChannelService:
+async def start_channel_service(app_config: AppConfig | None = None) -> ChannelService:
     """Create and start the global ChannelService from app config."""
     global _channel_service
     if _channel_service is not None:
         return _channel_service
-    _channel_service = ChannelService.from_app_config()
+    _channel_service = ChannelService.from_app_config(app_config)
     await _channel_service.start()
     return _channel_service
 
